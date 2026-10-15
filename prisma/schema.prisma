@@ -1,0 +1,872 @@
+// Finora database schema.
+// Money is stored as Decimal(19,4) and handled with decimal.js — never floats.
+// Every user-owned row carries userId and every query is scoped by it.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────────── Auth & users ─────────────────────────────
+
+model User {
+  id             String    @id @default(cuid())
+  name           String?
+  email          String    @unique
+  emailVerified  DateTime?
+  image          String?
+  passwordHash   String?
+  failedLogins   Int       @default(0)
+  lockedUntil    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  preferences    UserPreferences?
+  sessions       Session[]
+  oauthAccounts  OAuthAccount[]
+  accounts       Account[]
+  transactions   Transaction[]
+  categories     Category[]
+  tags           Tag[]
+  rules          TransactionRule[]
+  merchantMaps   MerchantMapping[]
+  budgets        Budget[]
+  recurring      RecurringTransaction[]
+  subscriptions  Subscription[]
+  bills          Bill[]
+  goals          SavingsGoal[]
+  debts          Debt[]
+  assets         Asset[]
+  receipts       Receipt[]
+  importBatches  ImportBatch[]
+  notifications  Notification[]
+  auditLogs      AuditLog[]
+  manualRates    ExchangeRate[]
+  householdRoles HouseholdMember[]
+  ownedHouseholds Household[]     @relation("HouseholdOwner")
+}
+
+model UserPreferences {
+  id                   String   @id @default(cuid())
+  userId               String   @unique
+  user                 User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  baseCurrency         String   @default("INR")
+  timezone             String   @default("Asia/Kolkata")
+  locale               String   @default("en-IN")
+  theme                String   @default("system")
+  weekStartsOn         Int      @default(1)
+  includePending       Boolean  @default(true)
+  excludeReimbursable  Boolean  @default(true)
+  dashboardLayout      Json?
+  // Notifications
+  notifyInApp          Boolean  @default(true)
+  notifyEmail          Boolean  @default(false)
+  quietHoursStart      Int?     // hour 0-23, local time
+  quietHoursEnd        Int?
+  budgetAlertLevels    Int[]    @default([50, 75, 90, 100])
+  lowBalanceThreshold  Decimal? @db.Decimal(19, 4)
+  billReminderDays     Int      @default(3)
+  alertsEnabled        Json?    // { budget: true, unusual: true, ... }
+  // AI
+  aiEnabled            Boolean  @default(false)
+  aiConsentAt          DateTime?
+  aiAutoCategorize     Boolean  @default(false)
+  // Retention
+  auditRetentionDays   Int      @default(365)
+  notificationRetentionDays Int @default(90)
+  onboardingDismissed  Boolean  @default(false)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+}
+
+// Auth.js models (kept for OAuth providers; credentials use JWT sessions).
+model OAuthAccount {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ───────────────────────────── Accounts ─────────────────────────────
+
+enum AccountType {
+  CASH
+  CHECKING
+  SAVINGS
+  CREDIT_CARD
+  DIGITAL_WALLET
+  INVESTMENT
+  LOAN
+  OTHER
+}
+
+enum AccountStatus {
+  ACTIVE
+  CLOSED
+  ARCHIVED
+}
+
+model Account {
+  id                 String        @id @default(cuid())
+  userId             String
+  user               User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name               String
+  type               AccountType
+  currency           String        @default("INR")
+  openingBalance     Decimal       @default(0) @db.Decimal(19, 4)
+  openingDate        DateTime      @default(now())
+  institution        String?
+  lastReconciledAt   DateTime?
+  reconciledBalance  Decimal?      @db.Decimal(19, 4)
+  notes              String?
+  status             AccountStatus @default(ACTIVE)
+  color              String?
+  includeInNetWorth  Boolean       @default(true)
+  // Bank sync is only ever true when a real provider connection exists.
+  syncProvider       String?
+  syncStatus         String?
+  householdId        String?
+  household          Household?    @relation(fields: [householdId], references: [id], onDelete: SetNull)
+  isSample           Boolean       @default(false)
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  transactions       Transaction[] @relation("TxnAccount")
+  incomingTransfers  Transaction[] @relation("TxnToAccount")
+  recurring          RecurringTransaction[]
+  subscriptions      Subscription[]
+  bills              Bill[]
+  goals              SavingsGoal[]
+  debts              Debt[]
+  budgets            Budget[]
+
+  @@index([userId, status])
+}
+
+// ───────────────────────────── Categories, tags, rules ─────────────────────────────
+
+enum CategoryKind {
+  EXPENSE
+  INCOME
+  TRANSFER
+}
+
+model Category {
+  id            String       @id @default(cuid())
+  userId        String
+  user          User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name          String
+  kind          CategoryKind @default(EXPENSE)
+  icon          String       @default("circle")
+  color         String       @default("slate")
+  parentId      String?
+  parent        Category?    @relation("CategoryTree", fields: [parentId], references: [id], onDelete: Cascade)
+  children      Category[]   @relation("CategoryTree")
+  monthlyTarget Decimal?     @db.Decimal(19, 4)
+  isEssential   Boolean      @default(false)
+  isSystem      Boolean      @default(false)
+  archived      Boolean      @default(false)
+  sortOrder     Int          @default(0)
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  transactions  Transaction[]
+  splits        TransactionSplit[]
+  rules         TransactionRule[]
+  merchantMaps  MerchantMapping[]
+  budgets       Budget[]
+  recurring     RecurringTransaction[]
+  subscriptions Subscription[]
+  bills         Bill[]
+
+  @@unique([userId, parentId, name])
+  @@index([userId])
+}
+
+model Tag {
+  id           String              @id @default(cuid())
+  userId       String
+  user         User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name         String
+  color        String              @default("slate")
+  transactions TransactionTag[]
+
+  @@unique([userId, name])
+}
+
+model TransactionTag {
+  transactionId String
+  tagId         String
+  transaction   Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  tag           Tag         @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([transactionId, tagId])
+  @@index([tagId])
+}
+
+enum RuleField {
+  DESCRIPTION
+  MERCHANT
+}
+
+enum RuleOperator {
+  CONTAINS
+  EQUALS
+  STARTS_WITH
+  REGEX
+}
+
+model TransactionRule {
+  id          String       @id @default(cuid())
+  userId      String
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name        String
+  field       RuleField    @default(DESCRIPTION)
+  operator    RuleOperator @default(CONTAINS)
+  value       String
+  amountMin   Decimal?     @db.Decimal(19, 4)
+  amountMax   Decimal?     @db.Decimal(19, 4)
+  categoryId  String
+  category    Category     @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  setMerchant String?
+  priority    Int          @default(100)
+  active      Boolean      @default(true)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  @@index([userId, active])
+}
+
+// Learned/confirmed merchant → category association.
+model MerchantMapping {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  merchant   String   // normalized merchant key
+  categoryId String
+  category   Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  confirmed  Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([userId, merchant])
+}
+
+// ───────────────────────────── Transactions ─────────────────────────────
+
+// Sign convention: `amount` is signed from the perspective of `accountId`, in the
+// account's currency. Outflows are negative, inflows positive.
+//   EXPENSE    amount < 0  → counts as spending
+//   INCOME     amount > 0  → counts as earnings
+//   REFUND     amount > 0  → reduces spending in its category (refunds, reimbursements, chargebacks)
+//   TRANSFER   amount < 0 on source; `toAmount` > 0 credited to `toAccountId`; never income/expense
+//   ADJUSTMENT any sign    → balance correction only; never income/expense
+enum TransactionType {
+  EXPENSE
+  INCOME
+  REFUND
+  TRANSFER
+  ADJUSTMENT
+}
+
+enum TransactionStatus {
+  CLEARED
+  PENDING
+}
+
+enum CategorySource {
+  USER
+  RULE
+  MERCHANT
+  HISTORY
+  AI
+  IMPORT
+  NONE
+}
+
+model Transaction {
+  id                 String            @id @default(cuid())
+  userId             String
+  user               User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accountId          String
+  account            Account           @relation("TxnAccount", fields: [accountId], references: [id], onDelete: Cascade)
+  type               TransactionType
+  status             TransactionStatus @default(CLEARED)
+  date               DateTime
+  description        String
+  merchant           String?
+  amount             Decimal           @db.Decimal(19, 4)
+  currency           String
+  // Foreign-currency purchase details (optional)
+  originalAmount     Decimal?          @db.Decimal(19, 4)
+  originalCurrency   String?
+  // Conversion of `amount` into the user's base currency
+  baseAmount         Decimal?          @db.Decimal(19, 4)
+  baseCurrency       String?
+  fxRate             Decimal?          @db.Decimal(19, 8)
+  fxRateDate         DateTime?
+  fxRateSource       String?
+  // Transfers
+  toAccountId        String?
+  toAccount          Account?          @relation("TxnToAccount", fields: [toAccountId], references: [id], onDelete: Cascade)
+  toAmount           Decimal?          @db.Decimal(19, 4)
+  toBaseAmount       Decimal?          @db.Decimal(19, 4)
+  // Categorization
+  categoryId         String?
+  category           Category?         @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  categorySource     CategorySource    @default(NONE)
+  categoryConfidence Float?
+  needsReview        Boolean           @default(false)
+  paymentMethod      String?
+  notes              String?
+  isReimbursable     Boolean           @default(false)
+  reimbursedById     String?           @unique
+  reimbursedBy       Transaction?      @relation("Reimbursement", fields: [reimbursedById], references: [id], onDelete: SetNull)
+  reimburses         Transaction?      @relation("Reimbursement")
+  recurringId        String?
+  recurring          RecurringTransaction? @relation(fields: [recurringId], references: [id], onDelete: SetNull)
+  occurrenceDate     DateTime?         // set when generated by a recurring schedule
+  importBatchId      String?
+  importBatch        ImportBatch?      @relation(fields: [importBatchId], references: [id], onDelete: Cascade)
+  importHash         String?
+  isSample           Boolean           @default(false)
+  deletedAt          DateTime?
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+
+  splits             TransactionSplit[]
+  tags               TransactionTag[]
+  receipts           Receipt[]
+  debtPayments       DebtPayment[]
+  goalContributions  GoalContribution[]
+  billPayments       BillPayment[]
+
+  @@unique([recurringId, occurrenceDate])
+  @@index([userId, date])
+  @@index([userId, deletedAt, date])
+  @@index([userId, categoryId])
+  @@index([accountId, date])
+  @@index([toAccountId])
+  @@index([userId, merchant])
+  @@index([userId, importHash])
+}
+
+model TransactionSplit {
+  id            String      @id @default(cuid())
+  transactionId String
+  transaction   Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  categoryId    String?
+  category      Category?   @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  // Positive magnitude in the transaction's currency
+  amount        Decimal     @db.Decimal(19, 4)
+  note          String?
+
+  @@index([transactionId])
+  @@index([categoryId])
+}
+
+// ───────────────────────────── Budgets ─────────────────────────────
+
+enum BudgetPeriod {
+  WEEKLY
+  MONTHLY
+  CUSTOM
+}
+
+enum BudgetMethod {
+  FIXED
+  ZERO_BASED
+  ENVELOPE
+  PERCENTAGE
+  ROLLOVER
+}
+
+enum BudgetScope {
+  OVERALL
+  CATEGORY
+  ACCOUNT
+  MERCHANT
+}
+
+model Budget {
+  id             String       @id @default(cuid())
+  userId         String
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name           String
+  scope          BudgetScope  @default(CATEGORY)
+  method         BudgetMethod @default(FIXED)
+  period         BudgetPeriod @default(MONTHLY)
+  amount         Decimal      @db.Decimal(19, 4)   // in base currency
+  percentOfIncome Decimal?    @db.Decimal(7, 4)    // for PERCENTAGE method
+  categoryId     String?
+  category       Category?    @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  accountId      String?
+  account        Account?     @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  merchant       String?
+  startDate      DateTime
+  endDate        DateTime?    // required for CUSTOM
+  alertLevels    Int[]        @default([50, 75, 90, 100])
+  active         Boolean      @default(true)
+  householdId    String?
+  household      Household?   @relation(fields: [householdId], references: [id], onDelete: SetNull)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  allocations    BudgetAllocation[]
+
+  @@index([userId, active])
+}
+
+// Per-period overrides / envelope funding records.
+model BudgetAllocation {
+  id          String   @id @default(cuid())
+  budgetId    String
+  budget      Budget   @relation(fields: [budgetId], references: [id], onDelete: Cascade)
+  periodStart DateTime
+  periodEnd   DateTime
+  allocated   Decimal  @db.Decimal(19, 4)
+  note        String?
+  createdAt   DateTime @default(now())
+
+  @@unique([budgetId, periodStart])
+}
+
+// ───────────────────────────── Recurring, subscriptions, bills ─────────────────────────────
+
+enum Frequency {
+  DAILY
+  WEEKLY
+  BIWEEKLY
+  MONTHLY
+  QUARTERLY
+  SEMIANNUAL
+  YEARLY
+  CUSTOM
+}
+
+model RecurringTransaction {
+  id            String          @id @default(cuid())
+  userId        String
+  user          User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name          String
+  type          TransactionType
+  accountId     String
+  account       Account         @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  categoryId    String?
+  category      Category?       @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  merchant      String?
+  amount        Decimal         @db.Decimal(19, 4) // positive magnitude
+  isVariable    Boolean         @default(false)    // variable income/expense: amount is an estimate
+  frequency     Frequency
+  interval      Int             @default(1)        // for CUSTOM: every N days
+  startDate     DateTime
+  nextDate      DateTime
+  endDate       DateTime?
+  autoCreate    Boolean         @default(true)
+  status        String          @default("PENDING") // PENDING or POSTED for created txns
+  active        Boolean         @default(true)
+  lastRunAt     DateTime?
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  transactions  Transaction[]
+
+  @@index([active, nextDate])
+  @@index([userId])
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  PAUSED
+  CANCELLED
+}
+
+model Subscription {
+  id                String             @id @default(cuid())
+  userId            String
+  user              User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name              String
+  merchant          String?
+  amount            Decimal            @db.Decimal(19, 4)
+  currency          String
+  frequency         Frequency
+  interval          Int                @default(1)
+  nextDate          DateTime
+  accountId         String?
+  account           Account?           @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  categoryId        String?
+  category          Category?          @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  startDate         DateTime
+  endDate           DateTime?
+  reminderDays      Int                @default(3)
+  cancellationNotes String?
+  status            SubscriptionStatus @default(ACTIVE)
+  detected          Boolean            @default(false)
+  previousAmount    Decimal?           @db.Decimal(19, 4)
+  amountChangedAt   DateTime?
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+
+  @@index([userId, status])
+}
+
+enum BillKind {
+  RENT
+  UTILITIES
+  PHONE_INTERNET
+  INSURANCE
+  LOAN
+  CREDIT_CARD
+  MEMBERSHIP
+  EDUCATION
+  OTHER
+}
+
+model Bill {
+  id             String     @id @default(cuid())
+  userId         String
+  user           User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name           String
+  kind           BillKind   @default(OTHER)
+  amount         Decimal    @db.Decimal(19, 4)
+  currency       String
+  isVariable     Boolean    @default(false)
+  frequency      Frequency  @default(MONTHLY)
+  interval       Int        @default(1)
+  nextDueDate    DateTime
+  accountId      String?
+  account        Account?   @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  categoryId     String?
+  category       Category?  @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  reminderDays   Int        @default(3)
+  autopay        Boolean    @default(false) // informational only — Finora never initiates payments
+  notes          String?
+  active         Boolean    @default(true)
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  payments       BillPayment[]
+
+  @@index([userId, active, nextDueDate])
+}
+
+model BillPayment {
+  id            String       @id @default(cuid())
+  billId        String
+  bill          Bill         @relation(fields: [billId], references: [id], onDelete: Cascade)
+  dueDate       DateTime
+  paidAt        DateTime
+  amount        Decimal      @db.Decimal(19, 4)
+  transactionId String?
+  transaction   Transaction? @relation(fields: [transactionId], references: [id], onDelete: SetNull)
+  late          Boolean      @default(false)
+
+  @@unique([billId, dueDate])
+}
+
+// ───────────────────────────── Goals ─────────────────────────────
+
+model SavingsGoal {
+  id                  String    @id @default(cuid())
+  userId              String
+  user                User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name                String
+  kind                String    @default("CUSTOM") // EMERGENCY, TRAVEL, EDUCATION, GADGET, VEHICLE, HOME, MAJOR, CUSTOM
+  icon                String    @default("target")
+  targetAmount        Decimal   @db.Decimal(19, 4)
+  currency            String
+  manualBalance       Decimal   @default(0) @db.Decimal(19, 4)
+  targetDate          DateTime?
+  linkedAccountId     String?
+  linkedAccount       Account?  @relation(fields: [linkedAccountId], references: [id], onDelete: SetNull)
+  monthlyContribution Decimal?  @db.Decimal(19, 4)
+  priority            Int       @default(2) // 1 high, 2 medium, 3 low
+  achievedAt          DateTime?
+  archived            Boolean   @default(false)
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  contributions       GoalContribution[]
+
+  @@index([userId])
+}
+
+model GoalContribution {
+  id            String       @id @default(cuid())
+  goalId        String
+  goal          SavingsGoal  @relation(fields: [goalId], references: [id], onDelete: Cascade)
+  amount        Decimal      @db.Decimal(19, 4) // negative for withdrawals
+  date          DateTime
+  note          String?
+  transactionId String?
+  transaction   Transaction? @relation(fields: [transactionId], references: [id], onDelete: SetNull)
+  createdAt     DateTime     @default(now())
+
+  @@index([goalId, date])
+}
+
+// ───────────────────────────── Debts ─────────────────────────────
+
+enum DebtType {
+  CREDIT_CARD
+  PERSONAL_LOAN
+  EDUCATION_LOAN
+  VEHICLE_LOAN
+  MORTGAGE
+  OTHER
+}
+
+model Debt {
+  id                String     @id @default(cuid())
+  userId            String
+  user              User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name              String
+  type              DebtType
+  lender            String?
+  currency          String
+  originalPrincipal Decimal    @db.Decimal(19, 4)
+  currentBalance    Decimal    @db.Decimal(19, 4)
+  interestRate      Decimal?   @db.Decimal(7, 4) // APR percent; null = unknown
+  minimumPayment    Decimal?   @db.Decimal(19, 4)
+  dueDay            Int?       // day of month
+  startDate         DateTime?
+  termMonths        Int?
+  // When set, this debt mirrors a LOAN/CREDIT_CARD account; net worth uses the account and skips this record.
+  linkedAccountId   String?
+  linkedAccount     Account?   @relation(fields: [linkedAccountId], references: [id], onDelete: SetNull)
+  customOrder       Int        @default(0)
+  notes             String?
+  closedAt          DateTime?
+  createdAt         DateTime   @default(now())
+  updatedAt         DateTime   @updatedAt
+
+  payments          DebtPayment[]
+
+  @@index([userId])
+}
+
+model DebtPayment {
+  id            String       @id @default(cuid())
+  debtId        String
+  debt          Debt         @relation(fields: [debtId], references: [id], onDelete: Cascade)
+  date          DateTime
+  amount        Decimal      @db.Decimal(19, 4)
+  principal     Decimal?     @db.Decimal(19, 4)
+  interest      Decimal?     @db.Decimal(19, 4)
+  isExtra       Boolean      @default(false)
+  note          String?
+  transactionId String?
+  transaction   Transaction? @relation(fields: [transactionId], references: [id], onDelete: SetNull)
+  createdAt     DateTime     @default(now())
+
+  @@index([debtId, date])
+}
+
+// ───────────────────────────── Net worth ─────────────────────────────
+
+enum AssetType {
+  PROPERTY
+  VEHICLE
+  INVESTMENT
+  CASH
+  OTHER
+}
+
+model Asset {
+  id         String     @id @default(cuid())
+  userId     String
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name       String
+  type       AssetType
+  currency   String
+  notes      String?
+  archived   Boolean    @default(false)
+  createdAt  DateTime   @default(now())
+  updatedAt  DateTime   @updatedAt
+
+  valuations AssetValuation[]
+
+  @@index([userId])
+}
+
+model AssetValuation {
+  id       String   @id @default(cuid())
+  assetId  String
+  asset    Asset    @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  date     DateTime
+  value    Decimal  @db.Decimal(19, 4)
+  source   String   @default("manual")
+  note     String?
+
+  @@unique([assetId, date])
+}
+
+// ───────────────────────────── FX ─────────────────────────────
+
+model ExchangeRate {
+  id        String   @id @default(cuid())
+  base      String
+  quote     String
+  date      DateTime @db.Date
+  rate      Decimal  @db.Decimal(19, 8)
+  source    String   // "frankfurter.app (ECB)" or "manual"
+  fetchedAt DateTime @default(now())
+  // null = shared provider rate; set = user's manual override
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([base, quote, date, source, userId])
+  @@index([base, quote, date])
+}
+
+// ───────────────────────────── Documents, imports ─────────────────────────────
+
+model Receipt {
+  id             String       @id @default(cuid())
+  userId         String
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactionId  String?
+  transaction    Transaction? @relation(fields: [transactionId], references: [id], onDelete: SetNull)
+  fileName       String
+  mimeType       String
+  size           Int
+  storageKey     String       @unique // encrypted file on private storage
+  ocrStatus      String       @default("NOT_RUN") // NOT_RUN, UNAVAILABLE, SUCCESS, FAILED
+  ocrData        Json?
+  ocrError       String?
+  createdAt      DateTime     @default(now())
+
+  @@index([userId])
+}
+
+model ImportBatch {
+  id           String        @id @default(cuid())
+  userId       String
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accountId    String?
+  fileName     String
+  format       String        // CSV, XLSX
+  status       String        @default("COMMITTED") // COMMITTED, ROLLED_BACK
+  rowCount     Int           @default(0)
+  importedCount Int          @default(0)
+  skippedCount Int           @default(0)
+  errorReport  Json?
+  mapping      Json?
+  createdAt    DateTime      @default(now())
+  rolledBackAt DateTime?
+
+  transactions Transaction[]
+
+  @@index([userId, createdAt])
+}
+
+// ───────────────────────────── Notifications & audit ─────────────────────────────
+
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  kind      String    // BUDGET, UNUSUAL, BILL, SUBSCRIPTION, LOW_BALANCE, MISSING_INCOME, GOAL, DUPLICATE, SYSTEM
+  severity  String    @default("info") // info, warning, critical, success
+  title     String
+  body      String
+  href      String?
+  dedupeKey String
+  readAt    DateTime?
+  emailedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@unique([userId, dedupeKey])
+  @@index([userId, readAt, createdAt])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  action     String   // e.g. transaction.update
+  entityType String
+  entityId   String?
+  before     Json?
+  after      Json?
+  ip         String?
+  createdAt  DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([entityType, entityId])
+}
+
+// Persistent job bookkeeping so the worker resumes cleanly after restarts.
+model JobRun {
+  id         String    @id @default(cuid())
+  name       String
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+  ok         Boolean?
+  detail     Json?
+
+  @@index([name, startedAt])
+}
+
+// ───────────────────────────── Household (optional, off by default) ─────────────────────────────
+
+model Household {
+  id        String            @id @default(cuid())
+  name      String
+  ownerId   String
+  owner     User              @relation("HouseholdOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  createdAt DateTime          @default(now())
+
+  members   HouseholdMember[]
+  accounts  Account[]
+  budgets   Budget[]
+}
+
+enum HouseholdRole {
+  OWNER
+  EDITOR
+  VIEWER
+}
+
+model HouseholdMember {
+  id          String        @id @default(cuid())
+  householdId String
+  household   Household     @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  userId      String
+  user        User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role        HouseholdRole @default(VIEWER)
+  createdAt   DateTime      @default(now())
+
+  @@unique([householdId, userId])
+}

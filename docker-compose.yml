@@ -1,0 +1,23 @@
+# Local PostgreSQL for development. Matches DATABASE_URL in .env.example.
+#   docker compose up -d
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: finora-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: finora
+      POSTGRES_PASSWORD: finora
+      POSTGRES_DB: finora
+    ports:
+      - "5434:5432"
+    volumes:
+      - finora-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U finora"]
+      interval: 5s
+      retries: 10
+
+volumes:
+  finora-pgdata:
+    external: true
